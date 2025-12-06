@@ -1,116 +1,163 @@
 #!/usr/bin/env python3
 import argparse
-import av
-import numpy as np
-import pyvirtualcam
+import subprocess
+import shutil
+import sys
 
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
 FPS = 30
 DEFAULT_DEVICE = "/dev/video10"
+DEFAULT_WEBCAM = "/dev/video0"
+
+current_proc: subprocess.Popen | None = None
 
 
-def run_pattern(device: str):
-    """Send animated color pattern to the virtual camera."""
-    with pyvirtualcam.Camera(
-        width=TARGET_WIDTH,
-        height=TARGET_HEIGHT,
-        fps=FPS,
-        device=device
-    ) as cam:
-        print(f"[INFO] Virtual camera started on {cam.device}")
-        print("[INFO] Mode: animated pattern (Ctrl+C to stop)")
+def check_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        print("[ERROR] ffmpeg not found. Install it with: sudo apt install ffmpeg")
+        sys.exit(1)
 
-        t = 0
+
+def stop_current():
+    global current_proc
+    if current_proc is not None:
+        print("[INFO] Stopping current source...")
         try:
-            while True:
-                frame = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), dtype=np.uint8)
-                frame[:, :, 0] = (t * 2) % 255     # B
-                frame[:, :, 1] = (t * 5) % 255     # G
-                frame[:, :, 2] = (t * 10) % 255    # R
-
-                cam.send(frame)
-                cam.sleep_until_next_frame()
-                t += 1
-
-        except KeyboardInterrupt:
-            print("\n[INFO] Pattern mode stopped.")
+            current_proc.terminate()
+            current_proc.wait(timeout=3)
+        except Exception:
+            pass
+        current_proc = None
+        print("[INFO] Source stopped.")
 
 
-def run_video(device: str, video_path: str, loop: bool):
-    """Stream a video file into the virtual camera."""
-    print(f"[INFO] Opening video: {video_path}")
+def start_pattern(device: str):
+    global current_proc
+    stop_current()
 
-    with pyvirtualcam.Camera(
-        width=TARGET_WIDTH,
-        height=TARGET_HEIGHT,
-        fps=FPS,
-        device=device
-    ) as cam:
-        print(f"[INFO] Virtual camera started on {cam.device}")
-        print("[INFO] Mode: video file → virtual cam (Ctrl+C to stop)")
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-re",
+        "-f", "lavfi",
+        "-i", f"testsrc=size={TARGET_WIDTH}x{TARGET_HEIGHT}:rate={FPS}",
+        "-vf", "format=yuv420p",
+        "-f", "v4l2",
+        device,
+    ]
 
+    print("[INFO] Starting PATTERN source →", device)
+    print("[DEBUG]", " ".join(cmd))
+    current_proc = subprocess.Popen(cmd)
+
+
+def start_video(device: str, video_path: str, loop: bool = True):
+    global current_proc
+    stop_current()
+
+    loop_args = ["-stream_loop", "-1"] if loop else []
+
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-re",
+        *loop_args,
+        "-i", video_path,
+        "-vf", f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},format=yuv420p",
+        "-f", "v4l2",
+        device,
+    ]
+
+    print(f"[INFO] Starting VIDEO source '{video_path}' → {device}")
+    print("[DEBUG]", " ".join(cmd))
+    current_proc = subprocess.Popen(cmd)
+
+
+def start_webcam(device: str, webcam: str):
+    global current_proc
+    stop_current()
+
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-f", "v4l2",
+        "-framerate", str(FPS),
+        "-video_size", f"{TARGET_WIDTH}x{TARGET_HEIGHT}",
+        "-i", webcam,
+        "-vf", "format=yuv420p",
+        "-f", "v4l2",
+        device,
+    ]
+
+    print(f"[INFO] Starting WEBCAM source {webcam} → {device}")
+    print("[DEBUG]", " ".join(cmd))
+    current_proc = subprocess.Popen(cmd)
+
+
+def menu_loop(device: str):
+    check_ffmpeg()
+    print(f"[INFO] Using virtual cam device: {device}")
+    print("[INFO] Integrated cam is assumed at /dev/video0 (you can change when asked).")
+
+    try:
         while True:
-            try:
-                container = av.open(video_path)
-            except av.AVError as e:
-                print(f"[ERROR] Could not open video: {e}")
-                return
+            print("\n=== Virtual Cam Switcher ===")
+            print("1) Pattern (test pattern)")
+            print("2) Video file → virtual cam")
+            print("3) Integrated webcam → virtual cam")
+            print("s) Stop current source")
+            print("q) Quit")
+            choice = input("Select option: ").strip().lower()
 
-            video_stream = container.streams.video[0]
-            video_stream.thread_type = "AUTO"
+            if choice == "1":
+                start_pattern(device)
 
-            try:
-                for frame in container.decode(video_stream):
-                    frame_resized = frame.reformat(
-                        width=TARGET_WIDTH,
-                        height=TARGET_HEIGHT
-                    )
-                    img = frame_resized.to_ndarray(format="rgb24")
+            elif choice == "2":
+                path = input("Enter video file path (e.g. 1.mp4): ").strip()
+                if not path:
+                    print("[WARN] No path given.")
+                    continue
+                loop_ans = input("Loop video? [Y/n]: ").strip().lower()
+                loop = (loop_ans != "n")
+                start_video(device, path, loop=loop)
 
-                    cam.send(img)
-                    cam.sleep_until_next_frame()
+            elif choice == "3":
+                cam = input(f"Enter webcam device [{DEFAULT_WEBCAM}]: ").strip()
+                if not cam:
+                    cam = DEFAULT_WEBCAM
+                start_webcam(device, cam)
 
-            except KeyboardInterrupt:
-                print("\n[INFO] Video mode stopped.")
-                return
+            elif choice == "s":
+                stop_current()
 
-            if not loop:
-                print("[INFO] Video finished (no loop).")
-                return
+            elif choice == "q":
+                print("[INFO] Exiting...")
+                break
 
-            print("[INFO] Video finished — looping again...")
+            else:
+                print("[WARN] Invalid choice.")
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted, exiting...")
+    finally:
+        stop_current()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Mini OBS-like virtual camera (Linux + v4l2loopback)"
+        description="Terminal switcher for virtual camera sources (ffmpeg + v4l2loopback)"
     )
-
     parser.add_argument(
         "--device",
         default=DEFAULT_DEVICE,
-        help=f"Virtual cam device path (default: {DEFAULT_DEVICE})"
+        help=f"Virtual camera device (default: {DEFAULT_DEVICE})",
     )
-
-    subparsers = parser.add_subparsers(dest="mode")
-
-    subparsers.add_parser("pattern", help="Send animated pattern to virtual cam")
-
-    video_parser = subparsers.add_parser("video", help="Stream a video file")
-    video_parser.add_argument("path", help="Video file path")
-    video_parser.add_argument("--loop", action="store_true", help="Loop video")
-
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    if args.mode == "video":
-        run_video(args.device, args.path, args.loop)
-    else:
-        run_pattern(args.device)
+    menu_loop(args.device)
 
 
 if __name__ == "__main__":
